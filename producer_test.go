@@ -4,6 +4,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	k "github.com/aws/aws-sdk-go/service/kinesis"
@@ -30,6 +31,13 @@ func (c *clientMock) PutRecords(input *k.PutRecordsInput) (*k.PutRecordsOutput, 
 		return nil, res.Error
 	}
 	return res.Response, nil
+}
+
+type slowClient struct{}
+
+func (c *slowClient) PutRecords(input *k.PutRecordsInput) (*k.PutRecordsOutput, error) {
+	time.Sleep(2 * time.Second)
+	return &k.PutRecordsOutput{FailedRecordCount: aws.Int64(0)}, nil
 }
 
 type testCase struct {
@@ -214,5 +222,37 @@ func TestNotify(t *testing.T) {
 
 	if !<-done {
 		t.Error("failed test: NotifyFailure\n\texpect failures channel to be closed")
+	}
+}
+
+func TestOverflow(t *testing.T) {
+	p := New(&Config{
+		StreamName:          "overflow",
+		MaxConnections:      1,
+		BatchCount:          1,
+		AggregateBatchCount: 10,
+		Client:              &slowClient{},
+	})
+	p.Start()
+	failed := 0
+	done := make(chan bool, 1)
+	go func() {
+		for _ = range p.OverflowFailures() {
+			failed++
+		}
+		// expect producer close the failures channel
+		done <- true
+	}()
+	rec := make([]byte, 10000)
+
+	for i := 0; i < 1000; i++ {
+		p.Put(rec, "bar")
+	}
+	p.Stop()
+
+	<-done
+
+	if failed < 50 {
+		t.Errorf("failed test: Overflow\n\texpeceted:%v\n\tactual:%v", 50, failed)
 	}
 }

@@ -80,7 +80,7 @@ func (c *Config) defaults() {
 	}
 	falseOrPanic(c.BatchSize > maxRequestSize, "kinesis: BatchSize exceeds 5MiB")
 	if c.BacklogCount == 0 {
-		c.BacklogCount = maxRecordsPerRequest
+		c.BacklogCount = c.BatchCount
 	}
 	if c.AggregateBatchCount == 0 {
 		c.AggregateBatchCount = maxAggregationCount

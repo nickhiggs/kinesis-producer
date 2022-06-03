@@ -22,21 +22,27 @@ var (
 	ErrStoppedProducer     = errors.New("Unable to Put record. Producer is already stopped")
 	ErrIllegalPartitionKey = errors.New("Invalid parition key. Length must be at least 1 and at most 256")
 	ErrRecordSizeExceeded  = errors.New("Data must be less than or equal to 1MB in size")
+	ErrOverflowProducer    = errors.New("Producer is backed up and cannot write any more records")
 )
 
 // Producer batches records.
 type Producer struct {
 	sync.RWMutex
 	*Config
-	aggregator *Aggregator
-	semaphore  semaphore
-	records    chan *kinesis.PutRecordsRequestEntry
-	failure    chan *FailureRecord
-	done       chan struct{}
+	aggregator   *Aggregator
+	semaphore    semaphore
+	records      chan *kinesis.PutRecordsRequestEntry
+	failure      chan *FailureRecord
+	overflowChan chan *FailureRecord
+	done         chan struct{}
 
 	// Current state of the Producer
 	// notify set to true after calling to `NotifyFailures`
 	notify bool
+	// Current state of the Producer
+	// overflow set to true after calling to `OverflowFailures`
+	overflow bool
+
 	// stopped set to true after `Stop`ing the Producer.
 	// This will prevent from user to `Put` any new data.
 	stopped bool
@@ -78,10 +84,10 @@ func (p *Producer) Put(data []byte, partitionKey string) error {
 	// if the record size is bigger than aggregation size
 	// handle it as a simple kinesis record
 	if nbytes > p.AggregateBatchSize {
-		p.records <- &kinesis.PutRecordsRequestEntry{
+		p.writeRecord(&kinesis.PutRecordsRequestEntry{
 			Data:         data,
 			PartitionKey: &partitionKey,
-		}
+		})
 	} else {
 		p.Lock()
 		needToDrain := nbytes+p.aggregator.Size()+md5.Size+len(magicNumber)+partitionKeyIndexSize > maxRecordSize || p.aggregator.Count() >= p.AggregateBatchCount
@@ -100,10 +106,26 @@ func (p *Producer) Put(data []byte, partitionKey string) error {
 		// we did it, because the "send" operation blocks when the backlog is full
 		// and this can cause deadlock(when we never release the lock)
 		if needToDrain && record != nil {
-			p.records <- record
+			p.writeRecord(record)
 		}
 	}
 	return nil
+}
+
+func (p *Producer) writeRecord(record *kinesis.PutRecordsRequestEntry) {
+	p.RLock()
+	overflow := p.overflow
+	p.RUnlock()
+	if !overflow {
+		p.records <- record
+		return
+	}
+
+	select {
+	case p.records <- record:
+	default:
+		p.overflowChan <- &FailureRecord{ErrOverflowProducer, record.Data, *record.PartitionKey}
+	}
 }
 
 // Failure record type
@@ -124,6 +146,17 @@ func (p *Producer) NotifyFailures() <-chan *FailureRecord {
 		p.failure = make(chan *FailureRecord, p.BacklogCount)
 	}
 	return p.failure
+}
+
+func (p *Producer) OverflowFailures() <-chan *FailureRecord {
+	p.Lock()
+	defer p.Unlock()
+	if !p.overflow {
+		p.overflow = true
+		p.overflowChan = make(chan *FailureRecord, p.BacklogCount)
+	}
+	return p.overflowChan
+
 }
 
 // Start the producer
@@ -154,6 +187,10 @@ func (p *Producer) Stop() {
 	p.RLock()
 	if p.notify {
 		close(p.failure)
+	}
+
+	if p.overflow {
+		close(p.overflowChan)
 	}
 	p.RUnlock()
 	p.Logger.Info("stopped producer")
